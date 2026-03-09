@@ -16,11 +16,9 @@ import federated_server
 import run_multiple_clients
 
 
-NUM_PARALLEL_EXECUTIONS = 2
+NUM_PARALLEL_EXECUTIONS = 1
 GRID_SEARCH_CONFIG_PATH = 'grid_search_config.json'
 
-# Keys used to uniquely identify a specific experiment configuration.
-# If these parameters are identical, the experiment is considered the same.
 MATCH_KEYS = [
     'model_name', 'global_epoch', 'local_epoch', 'num_clients', 'learning_rate',
     'models_percentage', 'aggregation_algorithm', 'pruning_threshold', 'num_custom_layers'
@@ -28,15 +26,10 @@ MATCH_KEYS = [
 
 
 # =============================================================================
-# FINGERPRINT HELPERS (O(1) lookup instead of O(n) per config)
+# FINGERPRINT HELPERS
 # =============================================================================
 
 def _normalize_fp_value(v) -> str:
-    """
-    Normalizes a config value to a canonical string for fingerprinting.
-    Avoids mismatches like '1' vs '1.0' or '0.5' vs '.5'.
-    Integer-valued floats are stored without decimals (1.0 -> "1").
-    """
     try:
         f = float(v)
         return str(int(f)) if f == int(f) else str(f)
@@ -45,20 +38,12 @@ def _normalize_fp_value(v) -> str:
 
 
 def make_config_fingerprint(config: dict) -> FrozenSet[Tuple[str, str]]:
-    """Creates a hashable fingerprint from the config using only MATCH_KEYS."""
     return frozenset(
         (k, _normalize_fp_value(config[k])) for k in MATCH_KEYS if k in config
     )
 
 
 def build_fingerprint_sets(global_csv_path: str) -> Tuple[Set, Set]:
-    """
-    Reads the CSV ONCE and builds two fingerprint sets:
-      - completed : configs with at least one 'Post-Pruning' row -> skip
-      - pre_only  : configs with only 'Pre-Pruning' -> incomplete, needs restart
-
-    This reduces duplicate-check cost from O(n) to O(1) per config.
-    """
     completed: Set[FrozenSet] = set()
     pre_only: Set[FrozenSet] = set()
 
@@ -85,7 +70,6 @@ def build_fingerprint_sets(global_csv_path: str) -> Tuple[Set, Set]:
         elif phase == 'Pre-Pruning':
             pre_only.add(fp)
 
-    # Incomplete = Pre-Pruning only (missing the Post-Pruning entry)
     incomplete = pre_only - completed
     return completed, incomplete
 
@@ -95,14 +79,8 @@ def build_fingerprint_sets(global_csv_path: str) -> Tuple[Set, Set]:
 # =============================================================================
 
 def remove_duplicate_configurations(global_csv_path: str) -> None:
-    """
-    Reads the CSV and removes duplicate rows based exclusively
-    on MATCH_KEYS and the execution_phase.
-    This safely ignores dynamic columns like paths, duration, and metrics.
-    """
     if not os.path.exists(global_csv_path):
         return
-
     try:
         df = pd.read_csv(global_csv_path, dtype=str)
     except Exception as e:
@@ -113,16 +91,9 @@ def remove_duplicate_configurations(global_csv_path: str) -> None:
         return
 
     original_rows = len(df)
-
-    # Identify duplicates using ONLY the configuration keys + the phase.
-    # Ensure we only check keys that are actually present in the CSV columns.
     subset_keys = [k for k in MATCH_KEYS if k in df.columns] + ['execution_phase']
-
-    # keep='last' keeps the most recent execution and discards the older ones.
     df_cleaned = df.drop_duplicates(subset=subset_keys, keep='last')
-
-    cleaned_rows = len(df_cleaned)
-    removed_count = original_rows - cleaned_rows
+    removed_count = original_rows - len(df_cleaned)
 
     if removed_count > 0:
         print(f"[CLEANUP] Removed {removed_count} duplicate rows from the CSV.")
@@ -133,13 +104,6 @@ def remove_duplicate_configurations(global_csv_path: str) -> None:
 
 def cleanup_incomplete_run(config: dict, global_csv_path: str,
                            models_dir: str, lock: multiprocessing.Lock) -> None:
-    """
-    Handles an incomplete run (only Pre-Pruning present in CSV):
-      1. Removes orphan rows from the CSV.
-      2. If the orphan run had a better F1 than the saved record,
-         deletes weights/keys from disk and cleans best_scores.json.
-    Called once per incomplete config before requeueing.
-    """
     model_name = config.get('model_name', 'unknown')
     print(f"[CLEAN & RESTART] Incomplete run (Pre-Pruning only) for {model_name} "
           f"(LR: {config.get('learning_rate')}).")
@@ -149,7 +113,6 @@ def cleanup_incomplete_run(config: dict, global_csv_path: str,
     except Exception:
         return
 
-    # Identify orphan rows matching the current config
     mask = pd.Series([True] * len(df))
     for k in MATCH_KEYS:
         if k in config and k in df.columns:
@@ -160,13 +123,10 @@ def cleanup_incomplete_run(config: dict, global_csv_path: str,
         return
 
     orphan_rows = df.loc[matched_indices].copy()
-
-    # 1. Remove from CSV
     df.drop(index=matched_indices, inplace=True)
     df.reset_index(drop=True, inplace=True)
     df.to_csv(global_csv_path, index=False)
 
-    # 2. JSON and Disk Cleanup
     if not models_dir:
         return
 
@@ -197,7 +157,6 @@ def cleanup_incomplete_run(config: dict, global_csv_path: str,
 
         saved_f1 = phase_record.get('metrics', {}).get('best_f1', -1.0)
 
-        # If existing record is better, don't delete files
         if orphan_f1 <= saved_f1:
             print(f"[CLEAN & RESTART] Saved best F1 ({saved_f1:.4f}) >= orphan F1 ({orphan_f1:.4f}) "
                   f"for {model_name}/{phase}. Skipping file deletion.")
@@ -234,22 +193,16 @@ def cleanup_incomplete_run(config: dict, global_csv_path: str,
 
 def save_best_model_if_needed(run_summary: dict, best_weights: list, lock: multiprocessing.Lock,
                               models_dir: str, config: dict, phase: str) -> None:
-    """
-    Checks if current model has a better F1 for its phase.
-    If yes, saves weights (.pkl), copies private key, and updates best_scores.json.
-    """
     if best_weights is None or run_summary is None:
         return
 
     model_name = run_summary.get('model_name', 'unknown')
     current_f1 = run_summary.get('best_f1', run_summary.get('f1_score', 0.0))
-
     safe_phase = phase.replace(" ", "_")
     ta_port = config.get('ta_port')
 
     metric_keys = {'best_f1', 'best_acc', 'best_prec', 'best_recall', 'best_loss',
                    'best_round', 'total_duration_sec', 'execution_phase', 'round_dataframe_path'}
-
     config_keys_to_exclude = {'worker_id', 'port', 'ta_port', 'csv_lock', 'log_dir',
                                'run_metrics_output_path', 'splitting_dir', 'dataset_path',
                                'MIN_NUM_WORKERS', 'ip_address', 'is_post_pruning_run'}
@@ -298,7 +251,8 @@ def save_best_model_if_needed(run_summary: dict, best_weights: list, lock: multi
             if ta_port:
                 temp_key_path = f'temp_keys/ta_privkey_port_{ta_port}.pkl'
                 if os.path.exists(temp_key_path):
-                    final_key_path = os.path.join(specific_model_dir, f"best_{model_name}_{safe_phase}_key.pkl")
+                    final_key_path = os.path.join(specific_model_dir,
+                                                  f"best_{model_name}_{safe_phase}_key.pkl")
                     shutil.copy(temp_key_path, final_key_path)
 
             print(f"\n[*] NEW RECORD ({phase}) for {model_name}! F1: {current_f1:.4f}. "
@@ -317,7 +271,6 @@ def load_json(filename: str) -> dict:
 
 
 def generate_configurations(base_config: dict, search_space: dict):
-    """Generates Cartesian product of all hyperparameters."""
     if not search_space:
         yield base_config
         return
@@ -329,7 +282,6 @@ def generate_configurations(base_config: dict, search_space: dict):
 
 
 def wait_for_server_ready(url: str, timeout: int = 60) -> bool:
-    """Waits for the Flask server to be ready for connections."""
     start_time = time.time()
     while time.time() - start_time < timeout:
         try:
@@ -346,11 +298,6 @@ def wait_for_server_ready(url: str, timeout: int = 60) -> bool:
 # =============================================================================
 
 def start_server_thread(config: dict, server_instance_ref: list) -> None:
-    """
-    Starts the federated server and captures the instance.
-    Monkey-patches _reset_for_new_training to preserve the Pre-Pruning aggregator
-    reference before it is replaced by the Post-Pruning one.
-    """
     worker_id = config.get('worker_id', 'N/A')
     port = config['port']
     print(f"[Worker {worker_id}] Starting server on port {port}...")
@@ -374,30 +321,104 @@ def start_server_thread(config: dict, server_instance_ref: list) -> None:
 
 
 # =============================================================================
+# ISOLATED SUBPROCESS — one per configuration
+# =============================================================================
+
+def _execute_single_config(config: dict, csv_lock: multiprocessing.Lock) -> None:
+    """
+    Esegue UNA singola configurazione FL in un processo figlio dedicato.
+
+    PERCHE' UN SUBPROCESS:
+    Python non garantisce la restituzione della RAM all'OS dopo gc.collect()
+    e del: l'allocatore glibc/PyMalloc mantiene la memoria nel proprio pool
+    interno per riutilizzarla in future allocazioni.
+    L'unica garanzia assoluta e' la morte del processo: quando questo ritorna,
+    il kernel dealloca l'intero spazio di indirizzamento — modello PyTorch,
+    array numpy dei pesi, dataset, Flask app, cache CUDA — senza eccezioni.
+    """
+    worker_id = config.get('worker_id', 'N/A')
+    model_name = config.get('model_name', '?')
+    server_instance_ref = []
+
+    try:
+        server_thread = threading.Thread(
+            target=start_server_thread,
+            args=(config, server_instance_ref),
+            daemon=True
+        )
+        server_thread.start()
+
+        server_url = f"http://{config['ip_address']}:{config['port']}/"
+        if wait_for_server_ready(server_url):
+            run_multiple_clients.main(config)
+        else:
+            print(f"[Worker {worker_id}] Unable to contact server. Skipping '{model_name}'.")
+
+        server_thread.join()
+
+        # -- WEIGHT SAVING (PRE & POST PRUNING) ------------------------------
+        if server_instance_ref:
+            server_obj = server_instance_ref[0]
+            models_dir = config.get('base_model_output_path', 'saved_models')
+
+            pre_agg = getattr(server_obj, 'pre_pruning_aggregator', None)
+            if pre_agg and pre_agg.best_model_weights is not None:
+                save_best_model_if_needed(
+                    pre_agg.run_summary, pre_agg.best_model_weights,
+                    csv_lock, models_dir, config, phase="Pre-Pruning"
+                )
+
+            post_agg = server_obj.aggregator
+            if post_agg and post_agg.best_model_weights is not None:
+                save_best_model_if_needed(
+                    post_agg.run_summary, post_agg.best_model_weights,
+                    csv_lock, models_dir, config, phase="Post-Pruning"
+                )
+        # --------------------------------------------------------------------
+
+    except Exception as e:
+        print(f"[Worker {worker_id}] Error in isolated subprocess for '{model_name}': {e}")
+        import traceback
+        traceback.print_exc()
+
+    # Nessun gc.collect() necessario: il processo sta per terminare e il kernel
+    # libera tutto il suo spazio di indirizzamento automaticamente.
+
+
+# =============================================================================
 # WORKER PROCESS
 # =============================================================================
 
-def run_grid_search_worker(worker_id: int, task_queue: multiprocessing.JoinableQueue, base_port: int,
-                           csv_lock: multiprocessing.Lock) -> None:
+def run_grid_search_worker(worker_id: int, task_queue: multiprocessing.JoinableQueue,
+                           base_port: int, csv_lock: multiprocessing.Lock) -> None:
     """
-    Worker process that pulls configurations from the queue and starts
-    the full FL cycle (Server + Clients) for each.
+    Worker long-running che preleva configurazioni dalla queue.
+    Per ogni configurazione lancia un subprocess figlio isolato e attende
+    il suo completamento prima di procedere con la successiva.
+
+    Gerarchia dei processi:
+        Main process
+          └─ Worker process  (questo, RAM stabile per tutta la grid search)
+               └─ Config subprocess  (uno per config, termina → OS libera tutto)
+                    ├─ Server thread
+                    └─ N Client threads
+
+    Il worker non alloca mai direttamente modelli o dataset.
     """
     print(f"--- Starting Grid Search Worker {worker_id} ---")
+
     while True:
-        # 1. Fetch from queue
         try:
             config = task_queue.get(timeout=1)
         except queue.Empty:
             continue
 
-        # 2. Check for stop signal (poison pill)
         if config is None:
             print(f"--- Worker {worker_id} received stop signal. Shutting down. ---")
             task_queue.task_done()
             break
 
-        # 3. Process the task
+        splitting_dir = None
         try:
             dataset_name = config['dataset_name']
             model_name = config['model_name']
@@ -414,48 +435,44 @@ def run_grid_search_worker(worker_id: int, task_queue: multiprocessing.JoinableQ
             run_identifier = f"{dataset_name}_{model_name}_w{worker_id}"
             config['log_dir'] = os.path.join(config['base_log_path'], run_identifier)
             config['run_metrics_output_path'] = os.path.join(config['base_csv_path'], dataset_name)
-            config['splitting_dir'] = os.path.join(config['base_split_data_path'], run_identifier)
+            splitting_dir = os.path.join(config['base_split_data_path'], run_identifier)
+            config['splitting_dir'] = splitting_dir
 
             os.makedirs(config['log_dir'], exist_ok=True)
-            os.makedirs(config['splitting_dir'], exist_ok=True)
+            os.makedirs(splitting_dir, exist_ok=True)
 
-            server_instance_ref = []
-            server_thread = threading.Thread(target=start_server_thread, args=(config, server_instance_ref),
-                                             daemon=True)
-            server_thread.start()
+            # Subprocess isolato: tutta la memoria pesante vive qui dentro.
+            # Quando config_proc.join() ritorna, il kernel ha gia' liberato tutto.
+            config_proc = multiprocessing.Process(
+                target=_execute_single_config,
+                args=(config, csv_lock),
+                daemon=False  # Non-daemon: attendiamo il completamento esplicito
+            )
+            config_proc.start()
+            config_proc.join()
 
-            server_url = f"http://{config['ip_address']}:{config['port']}/"
-            if wait_for_server_ready(server_url):
-                run_multiple_clients.main(config)
+            if config_proc.exitcode != 0:
+                print(f"[Worker {worker_id}] WARNING: subprocess for '{model_name}' "
+                      f"exited with code {config_proc.exitcode}.")
             else:
-                print(f"[Worker {worker_id}] Unable to contact server. Skipping configuration.")
-
-            server_thread.join()
-
-            # -- WEIGHT SAVING (PRE & POST PRUNING) --------------------------
-            if server_instance_ref:
-                server_obj = server_instance_ref[0]
-                models_dir = config.get('base_model_output_path', 'saved_models')
-
-                # Pre-Pruning: aggregator saved via monkey-patch before reset
-                pre_agg = getattr(server_obj, 'pre_pruning_aggregator', None)
-                if pre_agg and pre_agg.best_model_weights is not None:
-                    save_best_model_if_needed(pre_agg.run_summary, pre_agg.best_model_weights,
-                                              csv_lock, models_dir, config, phase="Pre-Pruning")
-
-                # Post-Pruning (or Standard): aggregator active at end of training
-                post_agg = server_obj.aggregator
-                if post_agg and post_agg.best_model_weights is not None:
-                    save_best_model_if_needed(post_agg.run_summary, post_agg.best_model_weights,
-                                              csv_lock, models_dir, config, phase="Post-Pruning")
-            # ---------------------------------------------------------------
-
-            time.sleep(1)
+                print(f"[Worker {worker_id}] Subprocess for '{model_name}' completed. "
+                      f"Memory fully released by OS.")
 
         except Exception as e:
-            print(f"[Worker {worker_id}] Error during execution: {e}")
+            print(f"[Worker {worker_id}] Error preparing configuration: {e}")
+            import traceback
+            traceback.print_exc()
+
         finally:
-            # 4. Signal that the task is finished only after processing it
+            # Pulizia del splitting_dir eseguita nel worker (non nel subprocess)
+            # per garantirla anche in caso di crash del subprocess.
+            if splitting_dir and os.path.isdir(splitting_dir):
+                try:
+                    shutil.rmtree(splitting_dir)
+                    print(f"[Worker {worker_id}] Removed splitting dir: {splitting_dir}")
+                except Exception as e:
+                    print(f"[Worker {worker_id}] Could not remove splitting dir: {e}")
+
             task_queue.task_done()
 
 
@@ -484,17 +501,13 @@ def main():
     models_dir = base_grid_config.get('base_model_output_path', 'saved_models')
     os.makedirs(models_dir, exist_ok=True)
 
-    # -- DUPLICATE CLEANUP ---------------------------------------------------
     print("Checking and removing any duplicate configurations in the CSV...")
     remove_duplicate_configurations(global_csv_path)
 
-    # -- KEY OPTIMIZATION ----------------------------------------------------
-    # Reads the CSV once to build fingerprint sets.
     print("Building fingerprint sets from existing CSV (one-time read)...")
     completed_fps, incomplete_fps = build_fingerprint_sets(global_csv_path)
     print(f"  Completed configs (Post-Pruning present): {len(completed_fps)}")
     print(f"  Incomplete configs (Pre-Pruning only):    {len(incomplete_fps)}")
-    # -----------------------------------------------------------------------
 
     configs_to_run_count = 0
     total_generated_configs = 0
@@ -515,14 +528,12 @@ def main():
                 total_generated_configs += 1
                 fp = make_config_fingerprint(hyper_config)
 
-                # 1) Already completed (Pre + Post) -> Skip O(1)
                 if fp in completed_fps:
                     continue
 
-                # 2) Pre-Pruning only -> Cleanup and Requeue
                 if fp in incomplete_fps:
                     cleanup_incomplete_run(hyper_config, global_csv_path, models_dir, csv_lock)
-                    incomplete_fps.discard(fp)   # Prevent double cleanup if duplicates exist
+                    incomplete_fps.discard(fp)
 
                 task_queue.put(hyper_config)
                 configs_to_run_count += 1
@@ -542,13 +553,15 @@ def main():
     base_port = base_grid_config['port']
 
     for i in range(NUM_PARALLEL_EXECUTIONS):
-        process = multiprocessing.Process(target=run_grid_search_worker, args=(i, task_queue, base_port, csv_lock))
+        process = multiprocessing.Process(
+            target=run_grid_search_worker,
+            args=(i, task_queue, base_port, csv_lock)
+        )
         processes.append(process)
         process.start()
 
     task_queue.join()
 
-    # Poison pill to stop workers
     for _ in range(NUM_PARALLEL_EXECUTIONS):
         task_queue.put(None)
 
