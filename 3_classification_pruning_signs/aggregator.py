@@ -164,15 +164,17 @@ class Aggregator:
 
         self.pruning_stats = valid
 
-        avg_reduction = np.mean([s.get('reduction_pct', 0) for s in valid])
-        total_before = sum(s.get('samples_before', 0) for s in valid)
-        total_after = sum(s.get('samples_after', 0) for s in valid)
-        overall_reduction = (1 - total_after / max(total_before, 1)) * 100
+        avg_reduction = np.mean([s.get('train_reduction_pct', 0) for s in valid])
+        total_train_before = sum(s.get('train_before', 0) for s in valid)
+        total_train_after = sum(s.get('train_after', 0) for s in valid)
+        total_valid_preserved = sum(s.get('valid_preserved', 0) for s in valid)
+        overall_reduction = (1 - total_train_after / max(total_train_before, 1)) * 100
 
         self.logger.info(
             "[PRUNING] Stats collected from %d clients — "
-            "avg per-client reduction: %.1f%%, overall: %d -> %d samples (%.1f%%)",
-            len(valid), avg_reduction, total_before, total_after, overall_reduction
+            "avg train reduction: %.1f%%, overall train: %d -> %d samples (%.1f%%), valid preserved: %d",
+            len(valid), avg_reduction, total_train_before, total_train_after,
+            overall_reduction, total_valid_preserved
         )
 
     def log_best_model_stats(self):
@@ -230,16 +232,18 @@ class Aggregator:
 
         # [PRUNING] Add aggregated pruning statistics if available
         if self.pruning_stats:
-            reductions = [s.get('reduction_pct', 0) for s in self.pruning_stats]
-            total_before = sum(s.get('samples_before', 0) for s in self.pruning_stats)
-            total_after = sum(s.get('samples_after', 0) for s in self.pruning_stats)
+            reductions = [s.get('train_reduction_pct', 0) for s in self.pruning_stats]
+            total_train_before = sum(s.get('train_before', 0) for s in self.pruning_stats)
+            total_train_after = sum(s.get('train_after', 0) for s in self.pruning_stats)
+            total_valid_preserved = sum(s.get('valid_preserved', 0) for s in self.pruning_stats)
             self.run_summary.update({
                 'pruning_num_clients': len(self.pruning_stats),
-                'pruning_avg_reduction_pct': round(float(np.mean(reductions)), 2),
-                'pruning_min_reduction_pct': round(float(np.min(reductions)), 2),
-                'pruning_max_reduction_pct': round(float(np.max(reductions)), 2),
-                'pruning_total_samples_before': total_before,
-                'pruning_total_samples_after': total_after,
+                'pruning_avg_train_reduction_pct': round(float(np.mean(reductions)), 2),
+                'pruning_min_train_reduction_pct': round(float(np.min(reductions)), 2),
+                'pruning_max_train_reduction_pct': round(float(np.max(reductions)), 2),
+                'pruning_total_train_before': total_train_before,
+                'pruning_total_train_after': total_train_after,
+                'pruning_total_valid_preserved': total_valid_preserved,
             })
 
         # Cleanup: remove unnecessary paths or overly verbose dictionaries from the summary

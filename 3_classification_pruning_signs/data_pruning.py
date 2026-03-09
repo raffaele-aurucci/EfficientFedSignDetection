@@ -14,16 +14,23 @@ LOCAL DATASET PRUNING MODULE
 This module implements decentralized data pruning logic.
 It runs entirely on the edge (client-side), ensuring data privacy.
 
-  - 1 → compute_influence_scores
+  - 1 → compute_influence_scores  (on train + valid for stable mu/sigma)
   - 2 → adaptive criterion with z-score normalization (z ∈ [-ε, +ε])
   - 3 → class safeguard
-  - 4 → physical dataset reconstruction
+  - 4 → physical dataset reconstruction (pruning applied to train only)
+
+Key design decision:
+  Influence scores are computed on the full local dataset (train + valid)
+  to obtain stable per-class mu and sigma estimates, especially important
+  when each client holds few samples. However, the pruning mask is applied
+  ONLY to the train split: the validation set is preserved intact to ensure
+  unbiased evaluation on the original data distribution.
 
 Z-score normalization ensures that ε has a consistent, architecture-independent
 meaning: "how many standard deviations from the center to keep".
-  - ε = 1.0 → ~68% of samples kept  (normal distribution assumption)
-  - ε = 2.0 → ~95% of samples kept
-  - ε = 0.5 → ~38% of samples kept
+  - ε = 1.0 → ~68% of train samples kept  (normal distribution assumption)
+  - ε = 2.0 → ~95% of train samples kept
+  - ε = 0.5 → ~38% of train samples kept
 """
 
 
@@ -35,7 +42,7 @@ def compute_influence_scores(model, dataset, device="cpu"):
     criterion = torch.nn.CrossEntropyLoss()
     dataloader = DataLoader(dataset, batch_size=1, shuffle=False)
 
-    # Find the last trainable Linear module
+    # Trova l'ultimo modulo Linear con requires_grad
     last_linear = None
     for module in model.modules():
         if isinstance(module, torch.nn.Linear) and any(p.requires_grad for p in module.parameters()):
@@ -44,7 +51,7 @@ def compute_influence_scores(model, dataset, device="cpu"):
     if last_linear is None:
         raise ValueError("[PRUNING] No trainable Linear layer found.")
 
-    # Collect all parameters of the layer (weight + bias)
+    # Raccogli tutti i parametri del layer (weight + bias)
     last_layer_params = [p for p in last_linear.parameters() if p.requires_grad]
 
     scores = []
@@ -62,7 +69,7 @@ def compute_influence_scores(model, dataset, device="cpu"):
             create_graph=False
         )
 
-        # L2 norm concatenated over weight and bias gradients
+        # Norma L2 concatenata su weight e bias
         combined_norm = torch.cat([g.flatten() for g in grads]).norm().item()
         scores.append(combined_norm)
 
@@ -74,15 +81,11 @@ def compute_influence_scores(model, dataset, device="cpu"):
 # ============================================================
 def prune_and_redistribute_client_dataset(model, client_root, thresholds=None, device="cpu"):
     """
-    [2;3;4 - Adaptive Criterion with Z-score Normalization and Class Safeguard]
+    [2;3;4 - Adaptive Criterion and Class Safeguard]
 
-    Calculates influence scores, applies z-score normalization per class,
-    filters samples within [-ε, +ε] z-score range, activates the safeguard
-    if necessary, and physically rebuilds the train/ and valid/ folders in-place.
-
-    Z-score normalization makes ε architecture-independent: the same ε value
-    produces consistent pruning aggressiveness regardless of whether the model
-    is a MobileNet, ViT, EfficientNet, etc.
+    Calculates influence scores, applies the adaptive statistical criterion
+    per class, activates the safeguard if necessary, and physically rebuilds
+    the train/ and valid/ folders in-place.
 
     Expected structure of client_root:
         client_root/
@@ -106,17 +109,24 @@ def prune_and_redistribute_client_dataset(model, client_root, thresholds=None, d
 
     print(f"[PRUNING] Starting on '{client_root}' with thresholds: {thresholds}")
 
-    # Load train + valid keeping original paths for reconstruction
-    dataset, all_samples, class_names = _load_datasets_keeping_structure(client_root)
+    # Load train + valid keeping original paths for reconstruction.
+    # train_count is the boundary index: [0, train_count) = train samples,
+    # [train_count, ...) = valid samples.
+    dataset, all_samples, class_names, train_count = _load_datasets_keeping_structure(client_root)
 
-    # Compute scores on the entire local dataset (train + valid together)
+    # Compute scores on the entire local dataset (train + valid together).
+    # Using both splits gives more stable per-class mu/sigma estimates,
+    # which is important when each client holds few samples.
     scores = compute_influence_scores(model, dataset, device=device)
 
     all_paths = np.array([s[0] for s in all_samples])
     all_labels_idx = np.array([s[1] for s in all_samples])
 
-    # Mask: True = keep sample, False = discard
+    # Mask: True = keep sample, False = discard.
+    # Valid samples are always kept regardless of their score —
+    # the validation set must remain intact for unbiased evaluation.
     keep_mask = np.zeros(len(scores), dtype=bool)
+    keep_mask[train_count:] = True  # preserve all valid samples unconditionally
 
     for cls_idx in np.unique(all_labels_idx):
         cls_name = class_names[cls_idx]
@@ -127,7 +137,9 @@ def prune_and_redistribute_client_dataset(model, client_root, thresholds=None, d
         else:
             eps = thresholds
 
-        indices = np.where(all_labels_idx == cls_idx)[0]
+        # Only consider train samples for pruning (indices < train_count).
+        # Valid samples are already kept unconditionally above.
+        indices = np.where((all_labels_idx == cls_idx) & (np.arange(len(scores)) < train_count))[0]
         cls_scores = scores[indices]
 
         # Bypass: the class is not pruned
@@ -136,26 +148,27 @@ def prune_and_redistribute_client_dataset(model, client_root, thresholds=None, d
             print(f"  -> Class '{cls_name}': SKIPPED (kept all {len(indices)})")
             continue
 
-        # Z-score normalization
-        mu = cls_scores.mean()
-        sigma = cls_scores.std()
+        # Z-score normalization: mu and sigma computed on train+valid scores
+        # for this class, giving a more stable reference distribution.
+        all_cls_indices = np.where(all_labels_idx == cls_idx)[0]
+        all_cls_scores = scores[all_cls_indices]
+        mu = all_cls_scores.mean()
+        sigma = all_cls_scores.std()
 
-        # Edge case: all scores are identical → zero variance, keep everything
+        # Edge case: all scores identical → zero variance, keep all train samples
         if sigma < 1e-8:
             keep_mask[indices] = True
-            print(f"  -> Class '{cls_name}': zero variance, kept all {len(indices)} "
+            print(f"  -> Class '{cls_name}': zero variance, kept all {len(indices)} train samples "
                   f"(mu={mu:.4f}, sigma≈0)")
             continue
 
         z_scores = (cls_scores - mu) / sigma
 
-        # Criterion: keep samples within [-ε, +ε] in z-score space.
-        # ε is now architecture-independent: same ε = same % of distribution
-        # regardless of the model's gradient magnitude scale.
+        # Criterion: keep train samples within [-ε, +ε] in z-score space.
         in_range = (z_scores >= -eps) & (z_scores <= eps)
         kept_indices_local = indices[in_range]
 
-        # CLASS SAFEGUARD: ensures minimum 10% of original or 15 samples
+        # CLASS SAFEGUARD: ensures minimum 10% of original train samples or 15 samples.
         min_samples = max(int(len(indices) * 0.1), 15)
 
         if len(kept_indices_local) < min_samples:
@@ -163,8 +176,7 @@ def prune_and_redistribute_client_dataset(model, client_root, thresholds=None, d
                   f"Activating class safeguard.")
             needed = min_samples - len(kept_indices_local)
 
-            # Recover discarded samples closest to the center (lowest |z-score|)
-            # i.e. the most "prototypical" samples among those discarded
+            # Recover discarded train samples closest to center (lowest |z-score|)
             rejected_mask = ~in_range
             rejected_indices_local = indices[rejected_mask]
             rejected_abs_z = np.abs(z_scores[rejected_mask])
@@ -173,11 +185,24 @@ def prune_and_redistribute_client_dataset(model, client_root, thresholds=None, d
             kept_indices_local = np.concatenate([kept_indices_local, recovered])
 
         keep_mask[kept_indices_local] = True
-        print(f"  -> Class '{cls_name}': {len(kept_indices_local)}/{len(indices)} kept "
+        print(f"  -> Class '{cls_name}': {len(kept_indices_local)}/{len(indices)} train samples kept "
               f"(eps={eps:.2f}, mu={mu:.4f}, sigma={sigma:.4f})")
+
+    # Compute pruning stats on train only (valid is always fully kept)
+    train_before = int(train_count)
+    train_after = int(keep_mask[:train_count].sum())
+    valid_total = int(len(scores) - train_count)  # always fully preserved
+
+    print(f"[PRUNING] Train: {train_after}/{train_before} kept | Valid: {valid_total}/{valid_total} (untouched)")
 
     # Physical in-place reconstruction
     pruning_stats = _rebuild_dataset_in_place(client_root, all_paths, all_labels_idx, class_names, keep_mask)
+
+    # Enrich stats with train-only pruning metrics
+    pruning_stats['train_before'] = train_before
+    pruning_stats['train_after'] = train_after
+    pruning_stats['valid_preserved'] = valid_total
+    pruning_stats['train_reduction_pct'] = round((1 - train_after / max(train_before, 1)) * 100, 2)
     return pruning_stats
 
 
@@ -222,10 +247,13 @@ def _load_datasets_keeping_structure(client_root):
         )
 
     ds_full = ConcatDataset([ds_train, ds_valid])
-    # Samples ordered: first all train, then all valid
+    # Samples ordered: first all train, then all valid.
+    # train_count marks the boundary: indices [0, train_count) are train,
+    # indices [train_count, ...) are valid.
     all_samples = ds_train.samples + ds_valid.samples
+    train_count = len(ds_train.samples)
 
-    return ds_full, all_samples, ds_train.classes
+    return ds_full, all_samples, ds_train.classes, train_count
 
 
 # ============================================================
