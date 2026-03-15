@@ -20,7 +20,7 @@ class ModelManager:
     Model categories:
       CNN (pure):   ResNet18, EfficientNet_B0, ConvNeXt_Atto
       Hybrid:       MobileViT_Small, EdgeNeXt_Small, EfficientFormer_L1
-      ViT (pure):   DeiT_Tiny, TinyViT_5M, FastViT_T12
+      ViT (pure):   DeiT_Tiny, Vit_Tiny_Patch16
     """
 
     # Mapping from internal model names to timm identifiers
