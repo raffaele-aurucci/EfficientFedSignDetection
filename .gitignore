@@ -2,5 +2,5 @@
 /.venv
 
 2_classification_signs/logs
-2_classification_signs/csv
+2_classification_signs/csv/Cropped_ROI
 2_classification_signs/run_dataset
