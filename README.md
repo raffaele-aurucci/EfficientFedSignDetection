@@ -41,7 +41,7 @@ The system follows a **distributed pipeline** where **edge devices** and the **c
 
 9. **Model Redistribution:** The new global model is redistributed to the edge devices to repeat the training cycle.
 
-<img src="plots/pipeline.png" width="85%"/>
+<img src="plots/pipeline.png" width="100%"/>
 
 ## Data Pruning Module
 
