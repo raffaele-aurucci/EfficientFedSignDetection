@@ -23,16 +23,18 @@ plt.rcParams.update({
 })
 
 models  = ['YOLO11n', 'YOLO11s', 'YOLO26n', 'YOLO26s']
-metrics = ['mAP@50', 'F1', 'Precision', 'Recall']
+metrics = ['mAP@50', 'mAP@50-95', 'Precision', 'Recall']
 fase1 = {
     'mAP@50':    [0.5068, 0.5721, 0.5228, 0.6085],
-    'F1':        [0.5597, 0.6116, 0.5630, 0.6326],
+    'mAP@50-95': [0.3184, 0.3744, 0.3275, 0.3987],
+    # 'F1':        [0.5597, 0.6116, 0.5630, 0.6326],
     'Precision': [0.7213, 0.7573, 0.7075, 0.7647],
     'Recall':    [0.4572, 0.5129, 0.4675, 0.5391],
 }
 fase2 = {
     'mAP@50':    [0.6641, 0.7293, 0.6730, 0.7450],
-    'F1':        [0.6648, 0.7161, 0.6690, 0.7214],
+    'mAP@50-95': [0.4544, 0.5224, 0.4600, 0.5388],
+    # 'F1':        [0.6648, 0.7161, 0.6690, 0.7214],
     'Precision': [0.7398, 0.7817, 0.7351, 0.7946],
     'Recall':    [0.6036, 0.6602, 0.6136, 0.6606],
 }
@@ -112,6 +114,6 @@ fig.legend(handles=[p1, p2], loc='lower center', ncol=2, fontsize=11,
            framealpha=0.9, edgecolor='#aaaaaa', bbox_to_anchor=(0.5, -0.03))
 
 fig.tight_layout(w_pad=3, h_pad=4)
-fig.savefig('yolo_comparison.png', bbox_inches='tight', facecolor='white')
+fig.savefig('yolo_comparison_new.png', bbox_inches='tight', facecolor='white')
 plt.close()
 print("Saved!")
